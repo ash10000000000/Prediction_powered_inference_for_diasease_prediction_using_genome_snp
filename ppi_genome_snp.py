@@ -1,67 +1,11 @@
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
 import matplotlib.pyplot as plt
 from scipy.stats import norm
-import os
-import urllib.request
-import subprocess
-from tqdm import tqdm
-import tarfile
 
-# Toggle for synthetic data if download fails
-use_synthetic = False  # Set to True if download takes too long
-
-# Download progress bar
-class DownloadProgressBar(tqdm):
-    def update_to(self, b=1, bsize=1, tsize=None):
-        if tsize is not None:
-            self.total = tsize
-        self.update(b * bsize - self.n)
-
-def download_file(url, output_path):
-    if not os.path.exists(output_path):
-        print(f"Downloading {url} to {output_path} (~{os.path.getsize(output_path)/1024/1024:.1f} MB)")
-        with DownloadProgressBar(unit='B', unit_scale=True, miniters=1, desc=output_path) as t:
-            urllib.request.urlretrieve(url, output_path, reporthook=t.update_to)
-    else:
-        print(f"{output_path} already exists, skipping download")
-
-# Download and setup bcftools
-def setup_bcftools():
-    bcftools_url = "https://github.com/samtools/bcftools/releases/download/1.20/bcftools-1.20.tar.bz2"
-    bcftools_tar = "bcftools-1.20.tar.bz2"
-    bcftools_dir = "bcftools-1.20"
-    bcftools_bin = os.path.join(bcftools_dir, "bcftools")
-    if not os.path.exists(bcftools_bin):
-        print("Downloading and setting up bcftools (~5 MB)")
-        download_file(bcftools_url, bcftools_tar)
-        with tarfile.open(bcftools_tar, "r:bz2") as tar:
-            tar.extractall()
-        subprocess.run(["make"], cwd=bcftools_dir, check=True)
-        os.chmod(bcftools_bin, 0o755)
-    return bcftools_bin
-
-# Download and filter VCF
-vcf_url = "ftp://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/ALL.chr22.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz"
-tbi_url = vcf_url + ".tbi"
-vcf_file = "ALL.chr22.vcf.gz"
-tbi_file = vcf_file + ".tbi"
-snp_vcf = "single_snp.vcf"
-
-if not use_synthetic and not os.path.exists(snp_vcf):
-    try:
-        print("Downloading 1000 Genomes chr22 VCF (~200 MB) and index (~100 KB)")
-        download_file(vcf_url, vcf_file)
-        download_file(tbi_url, tbi_file)
-        bcftools_bin = setup_bcftools()
-        print("Filtering VCF for rs738491 (chr22:16050408)")
-        subprocess.run([bcftools_bin, "view", "-r", "22:16050408-16050408", vcf_file, "-o", snp_vcf], check=True)
-    except Exception as e:
-        print(f"Download/filter failed: {e}. Switching to synthetic data.")
-        use_synthetic = True
-
-# Simplified PPI mean CI function
+# PPI and classical CI functions
 def ppi_mean_ci(Y, Yhat, Yhat_unlabeled, alpha=0.05):
     n, m = len(Y), len(Yhat_unlabeled)
     mu_labeled = np.mean(Y - Yhat)
@@ -74,7 +18,6 @@ def ppi_mean_ci(Y, Yhat, Yhat_unlabeled, alpha=0.05):
     z = norm.ppf(1 - alpha / 2)
     return mu_ppi - z * np.sqrt(var_ppi), mu_ppi + z * np.sqrt(var_ppi)
 
-# Simplified classical mean CI function
 def classical_mean_ci(Y, alpha=0.05):
     n = len(Y)
     mu = np.mean(Y)
@@ -82,90 +25,105 @@ def classical_mean_ci(Y, alpha=0.05):
     z = norm.ppf(1 - alpha / 2)
     return mu - z * np.sqrt(var), mu + z * np.sqrt(var)
 
-# Load or generate data
-if use_synthetic:
-    print("Using synthetic data (0 MB download)")
-    np.random.seed(42)
-    n_samples = 1000
-    snp = np.random.choice([0, 1, 2], size=n_samples, p=[0.5, 0.4, 0.1])
-    true_beta = 0.5
-    probs = 1 / (1 + np.exp(-(-1 + true_beta * snp)))
-    disease = np.random.binomial(1, probs)
-    data = pd.DataFrame({'SNP': snp, 'Disease': disease})
-else:
-    print("Parsing real 1000 Genomes VCF data (rs738491)")
-    genotypes = []
-    with open(snp_vcf, 'r') as f:
-        for line in f:
-            if line.startswith('#'): continue
-            fields = line.strip().split('\t')
-            gts = fields[9:]
-            genotypes.extend([sum(map(int, gt.split('|')[0].split('/'))) for gt in gts if gt != './.'])
-    snp = np.array(genotypes[:1000])  # Limit to 1000 samples for speed
-    np.random.seed(42)
-    probs = 1 / (1 + np.exp(-(-1 + 0.5 * snp)))
-    disease = np.random.binomial(1, probs)
-    data = pd.DataFrame({'SNP': snp, 'Disease': disease})
-
-# Problem setup
+# Set parameters
+true_beta = 2.0
+n_train = 10000
+n_total = 100000
+n_labeled = 50  # Increase to 100 if coverage is low
+num_trials = 100
 alpha = 0.05
-n_total = len(data)
-n_labeled = 50
-num_trials = 10
+p_snp = [0.5, 0.4, 0.1]
+
+# Generate training data
+np.random.seed(0)
+snp_train = np.random.choice([0, 1, 2], size=n_train, p=p_snp)
+probs_train = 1 / (1 + np.exp(-(-1 + true_beta * snp_train)))
+disease_train = np.random.binomial(1, probs_train)
+X_train = pd.DataFrame({'SNP': snp_train})
+y_train = disease_train
+
+# Train model with calibration
+base_model = LogisticRegression(random_state=42)
+model = CalibratedClassifierCV(base_model, method='sigmoid', cv=3)
+model.fit(X_train, y_train)
+
+# Generate inference data
+np.random.seed(42)
+snp = np.random.choice([0, 1, 2], size=n_total, p=p_snp)
+probs = 1 / (1 + np.exp(-(-1 + true_beta * snp)))
+disease = np.random.binomial(1, probs)
+data = pd.DataFrame({'SNP': snp, 'Disease': disease})
+true_mean = np.mean(probs)  # True expected probability
+
+# Run trials
 results = []
-
-# Run PPI and classical inference
 for trial in range(num_trials):
-    rand_idx = np.random.permutation(n_total)
-    X_labeled = data['SNP'].iloc[rand_idx[:n_labeled]].values.reshape(-1, 1)
-    y_labeled = data['Disease'].iloc[rand_idx[:n_labeled]].values
-    X_unlabeled = data['SNP'].iloc[rand_idx[n_labeled:]].values.reshape(-1, 1)
-
-    model = LogisticRegression(random_state=42)
-    model.fit(data[['SNP']], data['Disease'])
+    rng = np.random.RandomState(trial)  # Fixed seed per trial for stability
+    rand_idx = rng.permutation(n_total)
+    labeled_idx = rand_idx[:n_labeled]
+    unlabeled_idx = rand_idx[n_labeled:]
+    X_labeled = pd.DataFrame({'SNP': data['SNP'].iloc[labeled_idx]})
+    y_labeled = data['Disease'].iloc[labeled_idx].values
+    # Skip if unbalanced
+    if np.sum(y_labeled) < 2 or np.sum(y_labeled) > len(y_labeled) - 2:
+        print(f"Skipping trial {trial}: insufficient positive or negative samples")
+        continue
+    X_unlabeled = pd.DataFrame({'SNP': data['SNP'].iloc[unlabeled_idx]})
     yhat_labeled = model.predict_proba(X_labeled)[:, 1]
     yhat_unlabeled = model.predict_proba(X_unlabeled)[:, 1]
-
     ppi_ci = ppi_mean_ci(y_labeled, yhat_labeled, yhat_unlabeled, alpha)
     classical_ci = classical_mean_ci(y_labeled, alpha)
-
     results.append({'method': 'PPI', 'n': n_labeled, 'lower': ppi_ci[0], 'upper': ppi_ci[1], 'trial': trial})
     results.append({'method': 'Classical', 'n': n_labeled, 'lower': classical_ci[0], 'upper': classical_ci[1], 'trial': trial})
 
-# Imputation CI
-imputed_ci = classical_mean_ci(model.predict_proba(data[['SNP']])[:, 1] > 0.5, alpha)
+# Imputation
+yhat_all = model.predict_proba(pd.DataFrame({'SNP': data['SNP']}))[:, 1]
+imputed_ci = classical_mean_ci(yhat_all, alpha)
 results.append({'method': 'Imputation', 'n': np.nan, 'lower': imputed_ci[0], 'upper': imputed_ci[1], 'trial': 0})
 
-# Create DataFrame
 df = pd.DataFrame(results)
 df['width'] = df['upper'] - df['lower']
+df['covers'] = (df['lower'] <= true_mean) & (df['upper'] >= true_mean)
 
-# Plot
-plt.figure(figsize=(6, 3))
-for method, color in [('PPI', 'blue'), ('Classical', 'orange'), ('Imputation', 'green')]:
-    df_method = df[df['method'] == method]
-    if method == 'Imputation':
-        plt.errorbar([method], [df_method['lower'].mean()], yerr=[[0], [0]], fmt='o', color=color, label=method)
-    else:
-        for trial in range(5):
-            df_trial = df_method[df_method['trial'] == trial]
-            plt.errorbar([method], [df_trial['lower'].iloc[0]], 
-                         yerr=[[df_trial['lower'].iloc[0] - df_trial['lower'].iloc[0]], 
-                               [df_trial['upper'].iloc[0] - df_trial['lower'].iloc[0]]], 
-                         fmt='o', color=color, alpha=0.5)
-        plt.errorbar([method], [df_method['lower'].mean()], 
-                     yerr=[[df_method['lower'].mean() - df_method['lower'].min()], 
-                           [df_method['upper'].max() - df_method['lower'].mean()]], 
-                     fmt='o', color=color, label=method)
-plt.axhline(np.mean(data['Disease']), color='black', linestyle='--', label='True Mean')
-plt.ylabel('Disease Probability')
-plt.title('PPI vs Classical vs Imputation (1000G SNP)')
-plt.legend()
-plt.grid(True)
-plt.savefig('snp_ppi_ci.png')
-plt.show()
-
-# Print average CI widths
+# Print average CI widths and coverage
 print(f"PPI CI Width: {df[df['method'] == 'PPI']['width'].mean():.3f}")
 print(f"Classical CI Width: {df[df['method'] == 'Classical']['width'].mean():.3f}")
 print(f"Imputation CI Width: {df[df['method'] == 'Imputation']['width'].mean():.3f}")
+print(f"True Mean: {true_mean:.3f}")
+print(f"PPI Coverage: {df[df['method'] == 'PPI']['covers'].mean():.3f}")
+print(f"Classical Coverage: {df[df['method'] == 'Classical']['covers'].mean():.3f}")
+print("Note: Imputation CI is unrealistically narrow as it ignores model uncertainty.")
+
+# 1. Bar Chart with Error Bars
+plt.figure(figsize=(8, 5))
+methods = ['PPI', 'Classical', 'Imputation']
+means = [df[df['method'] == m]['width'].mean() for m in methods]
+stds = [df[df['method'] == m]['width'].std() / np.sqrt(num_trials) for m in methods]
+plt.bar(methods, means, yerr=stds, capsize=5, color=['#1f77b4', '#ff7f0e', '#2ca02c'], alpha=0.7)
+plt.ylabel('Average CI Width')
+plt.title('Average Confidence Interval Width by Method')
+plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+plt.savefig('ci_width_bar.png')
+plt.close()
+
+# 2. Box Plot of CI Widths
+plt.figure(figsize=(8, 5))
+df[df['method'].isin(['PPI', 'Classical'])].boxplot(column='width', by='method', grid=False)
+plt.title('Distribution of CI Widths by Method')
+plt.suptitle('')
+plt.xlabel('Method')
+plt.ylabel('CI Width')
+plt.savefig('ci_width_boxplot.png')
+plt.close()
+
+# 3. Coverage Bar Plot
+plt.figure(figsize=(8, 5))
+coverage = [df[df['method'] == m]['covers'].mean() for m in ['PPI', 'Classical']]
+plt.bar(['PPI', 'Classical'], coverage, color=['#1f77b4', '#ff7f0e'], alpha=0.7)
+plt.axhline(1 - alpha, color='black', linestyle='--', label=f'Nominal Coverage (1 - α = {1 - alpha})')
+plt.ylabel('Coverage Probability')
+plt.title('Coverage of True Mean by Method')
+plt.legend()
+plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+plt.savefig('coverage_bar.png')
+plt.close()
