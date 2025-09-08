@@ -1,8 +1,8 @@
-🧬 Prediction-Powered Inference (PPI) for Genome SNP Disease Probability Estimation
+Prediction-Powered Inference (PPI) for Genome SNP Disease Probability Estimation
 
 This repository implements Prediction-Powered Inference (PPI) to estimate disease probability from synthetic Single Nucleotide Polymorphism (SNP) data. The project demonstrates how PPI can combine machine learning predictions from large unlabeled datasets with limited labeled data to produce narrower confidence intervals (CIs) while maintaining statistical validity.
 
-📌 Project Overview
+Project Overview
 
 Goal: Compare PPI, classical, and imputation approaches in estimating disease probability from genotype data (0, 1, 2).
 
@@ -22,13 +22,13 @@ CI width → Precision of estimate.
 
 Coverage → Reliability (how often the true value lies within CI).
 
-⚙️ Features & Enhancements
+Features & Enhancements
 
-✔ Sigmoid calibration using CalibratedClassifierCV for improved probability estimates.
-✔ Trial skipping when labeled sets are too imbalanced (<2 positives/negatives).
-✔ Fixed seeds for reproducibility across trials.
-✔ Coverage calculation to assess reliability.
-✔ Visualization outputs:
+Sigmoid calibration using CalibratedClassifierCV for improved probability estimates.
+Trial skipping when labeled sets are too imbalanced (<2 positives/negatives).
+Fixed seeds for reproducibility across trials.
+Coverage calculation to assess reliability.
+Visualization outputs:
 
 ci_width_bar.png → CI width comparison.
 
@@ -36,7 +36,7 @@ ci_width_boxplot.png → Distribution of CI widths across trials.
 
 coverage_bar.png → Coverage comparison between methods.
 
-📊 Results
+Results
 Method	CI Width	Coverage
 PPI	0.235	0.930
 Classical	0.277	0.940
